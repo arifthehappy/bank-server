@@ -11,6 +11,7 @@ const PermissionSchema = new mongoose.Schema({
   valid_until: { type: Date, required: true }, // unix timestamp epoch
   delegation_proof: { type: String, required: true }, // hash(delegation_id + employee_number + permission_map + secret_key)
   // nonce: { type: String, required: true },
+  delegation_allowed: { type: Boolean, default: false }, // true if the delegation is allowed
   prover_did: { type: String, required: false },
   revoked: { type: Boolean, default: false },
 }, { timestamps: true });

@@ -1,14 +1,84 @@
 const express = require("express");
 const Employee = require("../models/Employee");
 const axios = require("axios");
+dotenv = require("dotenv");
+dotenv.config();
+
 const Permissions = require("../models/Permissions");
 const AGENT_URL = process.env.AGENT_URL || "http://localhost:7001"; // Replace with your agent URL
 
 const router = express.Router();
 
+const SECRET_KEY = process.env.SECRET_KEY;
+const crypto = require("crypto");
+console.log(SECRET_KEY, "SECRET_KEY");
 const api = axios.create({
   baseURL: AGENT_URL
 });
+
+function verifyDelegationProof(permission, secretKey) {
+  console.log("secretKey:", secretKey);
+  console.log("Verifying delegation proof for permission:", permission);
+  // Recreate the hash: delegation_id + employee_number + permissions_map + secretKey
+  const data = `${permission.delegation_id}${permission.employee_number}${permission.permissions_map}${secretKey}`;
+  console.log(data, "data");
+  const hash = crypto.createHash("sha256").update(data).digest("hex");
+  console.log("Recreated hash:", hash);
+  console.log("Original delegation proof:", permission.delegation_proof);
+  // Compare the recreated hash with the stored delegation_proof
+  return hash === permission.delegation_proof;
+}
+
+function isValidDateRange(valid_from, valid_until) {
+  const now = Date.now();
+  console.log("Current time:", now);
+  console.log("Valid from:", valid_from);
+  console.log("Valid until:", valid_until);
+  // Convert valid_from and valid_until to epoch time
+  const from = new Date(String(`${valid_from}`)).getTime();
+  const until = new Date(String(`${valid_until}`)).getTime();
+  console.log("Valid from epoch:", from);
+  console.log("Valid until epoch:", until);
+  // Check if the current time is within the valid range
+  const isValid = now >= from && now <= until;
+  console.log("Is valid date range:", isValid);
+  return isValid;
+}
+
+// Recursive Chain Verification
+async function verifyDelegationChain(permission) {
+  console.log("Verifying permission:", permission);
+  // 1. Check revoked
+  if (permission.revoked) return { valid: false, reason: "revoked" };
+
+  // 2. Check validity period
+  if (!isValidDateRange(permission.valid_from.toISOString(), permission.valid_until.toISOString())) {
+    return { valid: false, reason: "not in validity period" };
+  }
+
+  // 3. Check delegation_proof
+  if (!verifyDelegationProof(permission, SECRET_KEY)) {
+    return { valid: false, reason: "invalid delegation proof" };
+  }
+
+  // 4. If basePermission, chain ends here
+  if (permission.credential_type === "basePermission") {
+    return { valid: true, permission };
+  }
+
+  // 5. If delegatedPermission, check the parent in the chain
+  if (permission.credential_type === "delegatedPermission") {
+    // Find the parent permission by delegated_by
+    const parent = await Permissions.findOne({
+      delegation_id: permission.delegated_by
+    });
+    if (!parent) return { valid: false, reason: "parent permission not found" };
+    // Recursively verify the parent
+    return await verifyDelegationChain(parent);
+  }
+
+  return { valid: false, reason: "unknown credential_type" };
+}
 
 // Middleware to check if the user is logged in
 
@@ -117,6 +187,7 @@ router.post("/permissions/new", async (req, res) => {
   const valid_from = data.by_format.cred_issue.indy.values.valid_from.raw;
   const valid_until = data.by_format.cred_issue.indy.values.valid_until.raw;
   const delegation_proof = data.by_format.cred_issue.indy.values.delegation_proof.raw;
+  const delegation_allowed = data.by_format.cred_issue.indy.values.delegation_allowed.raw;
   // const nonce = data.by_format.cred_issue.indy.values.nonce.raw;
   // const revoked = data.by_format.cred_issue.indy.values.revoked.raw;
 
@@ -146,6 +217,7 @@ router.post("/permissions/new", async (req, res) => {
       valid_from: valid_from_epoch,
       valid_until: valid_until_epoch,
       delegation_proof,
+      delegation_allowed,
       prover_did,
       revoked: false
     });
@@ -243,6 +315,72 @@ router.post("/login", async (req, res) => {
   }
 });
 
+// request permissions proof
+router.post("/request-permissions-proof", async(req, res)=>{
+  const {connection_id} = req.body;
+
+  //build the proof request 
+  const proofRequest = {
+    auto_verify: true,
+    comment: "Requesting Permission Proof",
+    connection_id,
+    presentation_request: {
+      indy: {
+        name: "Permission Verification",
+        requested_attributes: {
+          "additionalProp1": { 
+            name: "delegation_id" 
+          },
+          "additionalProp2": { 
+            name: "employee_number" 
+          },
+          "additionalProp3": { 
+            name: "delegated_by" 
+          },
+          "additionalProp4": { 
+            name: "delegated_by_employee_number" 
+          },
+          "additionalProp5": { 
+            name: "permissions_map" 
+          },
+          "additionalProp6": { 
+            name: "valid_from" 
+          },
+          "additionalProp7": { 
+            name: "valid_until" 
+          },
+          "additionalProp8": { 
+            name: "delegation_proof" 
+          },
+          "additionalProp9": { 
+            name: "credential_type" 
+          },
+          "additionalProp10": { 
+            name: "delegation_allowed" 
+          }
+        },
+        requested_predicates: {},
+        version: "1.0",
+        nonce: "1234567890"
+      }
+    }
+  }
+
+  console.log("Proof request:", proofRequest);
+
+  try {
+    const response =   await axios.post("https://w80khfvj-7001.inc1.devtunnels.ms/present-proof-2.0/send-request", proofRequest);
+    console.log("Proof request sent; response:", response.data);
+    // Handle the response as needed
+    res.status(200).json({ message: "Proof request sent. Please verify in your wallet.", data: response.data });
+  }
+  catch (error) {
+    console.error("Error sending proof request:", error);
+    res.status(500).json({ error, message: "Failed to send proof request" });
+  }
+
+})
+
 // Get a employee by connection_id
 // Fetch user details by connection_id
 router.get("/user-details/:connection_id", async (req, res) => {
@@ -260,6 +398,43 @@ router.get("/user-details/:connection_id", async (req, res) => {
   } catch (error) {
     console.error("Error fetching user details:", error);
     res.status(500).json({ error: "Failed to fetch user details" });
+  }
+});
+
+// fetch permission details by delegation id and verify chain
+router.get("/permissions/:delegation_id", async(req, res) =>{
+  const { delegation_id } = req.params;
+  console.log("Fetching permission details for delegation_id:", delegation_id);
+  try {
+    const permission = await Permissions.findOne({ delegation_id });
+    console.log("Permission found:", permission);
+    if (!permission) {
+      return res.status(404).json({ error: "Permission not found" });
+    }
+
+    // Verify the delegation chain
+    const result = await verifyDelegationChain(permission);
+    if (!result.valid) {
+      console.log("Permission is not valid:", result.reason);
+      return res.status(403).json({ error: "Permission is not valid", reason: result.reason });
+    }
+
+    // If valid, return the permission details
+    console.log("Permission is valid returning:", permission);
+    res.status(200).json(permission);
+  } catch (error) {
+    console.error("Error fetching permission details:", error);
+    res.status(500).json({ error: "Failed to fetch and verify permission details" });
+  }
+})
+
+router.get("/employees", async (req, res) => {
+  try {
+    const employees = await Employee.find({});
+    res.status(200).json(employees);
+  } catch (error) {
+    console.error("Error fetching employees:", error);
+    res.status(500).json({ error: "Failed to fetch employees" });
   }
 });
 
