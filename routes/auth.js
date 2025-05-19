@@ -438,4 +438,128 @@ router.get("/employees", async (req, res) => {
   }
 });
 
+function createDelegationProof(delegationData) {
+  // Implement the logic to create a delegation proof for the given delegation data
+  const data = `${delegationData.delegation_id}${delegationData.employee_number}${delegationData.permissions_map}${SECRET_KEY}`;
+  console.log(data, "data");
+  const hash = crypto.createHash("sha256").update(data).digest("hex");
+  console.log("Delegation proof hash:", hash);
+  // Return the delegation proof
+  return hash;
+}
+
+// POST api to delegate permissions
+router.post("/delegate/:did", async (req, res) => {
+  const { did } = req.params;
+  console.log("Delegation request received from DID:", did);
+  const delegationData = req.body;
+  console.log("Delegation data in request:", delegationData);
+
+  // create delegation proof for delegation data
+  const delegationProof = await createDelegationProof(delegationData);
+  // enter delegation proof in delegation data
+  delegationData.delegation_proof = delegationProof;
+  console.log("Delegation proof created:", delegationProof);
+  // get connection id of employee to send credential from database
+  const employee = await Employee.findOne({ employee_number: delegationData.employee_number });
+  const selectedConnectionIdSend = employee.connection_id;
+  // get cred def id of employee to send credential
+  // setting static cred def id for now for permissions should be dynamic in future
+  const selectedCredDefIdSend = "VwJVVUv3Vqm8c8FhzTVeea:3:CL:36:permissions30.04.2025"
+  // comment to send delegated permission
+  const commentSend = "sending delegated permission";
+
+  const attributesArray = Object.entries(delegationData).map(([key, value]) => ({
+    name: key,
+    value: String(value), // Ensure all values are strings
+  }));
+
+  const payloadData = {
+      connection_id: selectedConnectionIdSend,
+      commentSend,
+      credential_preview: {
+        "@type": "issue-credential/2.0/credential-preview",
+        attributes: attributesArray,
+      },
+      filter: {
+        indy: {
+          cred_def_id: selectedCredDefIdSend,
+        },
+      },
+  }
+
+  console.log("Payload data: ",payloadData);
+  // console.log("payload attributes: ", payloadData.credential_preview.attributes);
+  // res.status(200).json({ message: "dummy Delegation request sent. employee to receive in wallet.", data: payloadData });
+  // send credential api to agent
+  try{
+    const response = await axios.post(`${AGENT_URL}/issue-credential-2.0/send`, payloadData);
+    console.log("Credential sent; response:", response.data);
+    // Handle the response as needed
+    res.status(200).json({ message: "Credential sent. employee to receive in wallet.", data: response.data });
+  }
+  catch (error) {
+    console.error("Error sending credential:", error);
+    res.status(500).json({ error, message: "Failed to send credential" });
+  }
+  
+});
+
+const BANK_OWNER_DID = process.env.BANK_OWNER_DID; // Add this to your .env file
+
+// Fetch delegations made by a specific employee
+router.get("/delegations/by-me/:employeeNumber", async (req, res) => {
+  const { employeeNumber } = req.params;
+  try {
+    const delegations = await Permissions.find({ delegated_by_employee_number: employeeNumber });
+    if (!delegations) {
+      return res.status(404).json({ error: "No delegations found for this employee." });
+    }
+    res.status(200).json(delegations);
+  } catch (error) {
+    console.error("Error fetching delegations by employee:", error);
+    res.status(500).json({ error: "Failed to fetch delegations" });
+  }
+});
+
+// Revoke a specific delegation
+router.post("/delegations/revoke/:delegationId", async (req, res) => {
+  const { delegationId } = req.params;
+  const { requesterEmployeeNumber, requesterDid } = req.body;
+
+  if (!requesterEmployeeNumber || !requesterDid) {
+    return res.status(400).json({ error: "Requester employee number and DID are required." });
+  }
+
+  if (!BANK_OWNER_DID) {
+    console.error("BANK_OWNER_DID is not set in environment variables.");
+    return res.status(500).json({ error: "Server configuration error." });
+  }
+
+  try {
+    const delegation = await Permissions.findOne({ delegation_id: delegationId });
+    if (!delegation) {
+      return res.status(404).json({ error: "Delegation not found." });
+    }
+
+    // Authorization check
+    const isOwner = requesterDid === BANK_OWNER_DID;
+    const isDelegator = requesterEmployeeNumber === delegation.delegated_by_employee_number;
+
+    if (!isOwner && !isDelegator) {
+      return res.status(403).json({ error: "Unauthorized to revoke this delegation." });
+    }
+
+    if (delegation.revoked) {
+      return res.status(400).json({ message: "Delegation is already revoked." });
+    }
+    delegation.revoked = true;
+    await delegation.save();
+    res.status(200).json({ message: "Delegation revoked successfully.", delegation });
+  } catch (error) {
+    console.error("Error revoking delegation:", error);
+    res.status(500).json({ error: "Failed to revoke delegation" });
+  }
+});
+
 module.exports = router;
